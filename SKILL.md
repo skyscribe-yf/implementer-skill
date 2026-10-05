@@ -22,26 +22,62 @@ Self-contained implementation subagent with review-fix loop and CI-gated PR crea
 
 ---
 
-## Absolute Local Verification Policy
+## Local Verification Policy
 
 This policy applies to the implementer, every implementation/fix worker, and every reviewer
-while working in a local checkout. It is an absolute prohibition, not a default or a suggestion:
+while working in a local checkout.
 
-- **NEVER run a full test or regression suite locally.** This includes full backend/frontend
-  suites, directory or glob test runs, builds or graded test aliases, and any local fallback
-  intended to replace CI when CI is unavailable.
-- **NEVER pull, build, start, or use a local container.** Do not invoke Docker, Docker Compose,
-  Podman, Testcontainers, or scripts that do so; do not pull images or connect tests to a local
-  container.
-- **NEVER run database-dependent tests locally.** This includes tests, fixtures, migrations,
-  integration checks, or scripts that require PostgreSQL, MySQL, SQLite, Redis, or another
-  database/service. If a check's database/container requirement is uncertain, treat it as
-  forbidden and defer it to CI.
-- Targeted checks are allowed only when they are demonstrably database-free and
-  container-free. Record deferred database/container/full-regression checks with their exact
-  command; CI owns them.
+### Step 1 — Establish who owns full verification
 
-These prohibitions remain in force during review-fix rounds and when CI is unreachable.
+Before anything else, determine whether this repository has CI that runs on pull requests:
+
+```bash
+gh pr checks <PR_NUMBER> 2>&1 | head      # after a PR exists
+ls .github/workflows/                     # PR-triggered jobs?
+```
+
+- **`CI-backed`** — a PR-triggered job covers full regression. Full-suite, container, and
+  database-backed checks are **forbidden locally**: they duplicate work CI already does, and on a
+  large repo they cost far more time than they save. Defer them to CI.
+- **`CI-absent`** — no PR-triggered job covers them. Then *someone* has to run them or they never
+  run at all. The implementer runs full regression once at the Phase Gate, on the merged result,
+  and records it as evidence. Workers still stay scoped (below); the orchestrator is what expands.
+
+State which mode you are in and why, in one line, before dispatching workers. An unstated
+assumption here is how a repo ends up with green PRs that were never actually tested.
+
+### Step 2 — Rules that hold in both modes
+
+These apply to the implementer, every worker, and every reviewer regardless of CI:
+
+- **Never let a *worker* run a full suite.** Not in CI-backed mode (CI owns it), not in CI-absent
+  mode (the orchestrator owns it at the gate). Full-suite runs inside a lane are slow, redundant
+  with its siblings, and destroy parallelism. Workers run targeted, scoped checks only.
+- **Never pull, build, start, or use a local container** unless the repository's own documented
+  workflow requires it (Testcontainers-based integration suites, for example). When a project has
+  committed to that workflow, following it is not a violation.
+- **Prefer deferring over guessing.** If you cannot tell whether a check is database- or
+  container-dependent, treat it as such and record it rather than running it speculatively.
+- **Record every deferral** with the exact command and who will run it. A deferred gate nobody
+  claims is the failure mode this policy can create.
+
+### CI-backed mode — additional restriction
+
+- **NEVER run a full test or regression suite locally.** Full backend/frontend suites, directory or
+  glob test runs, builds or graded test aliases, and any local fallback standing in for CI.
+- **NEVER run database-dependent tests locally** (PostgreSQL, MySQL, SQLite, Redis, or equivalent),
+  unless the repo documents that as the only way to run them.
+
+These remain in force during review-fix rounds and when CI is unreachable — if CI is unreachable
+mid-run, report `DONE (CI unavailable)` and keep the PR open rather than filling the gap locally.
+
+### CI-absent mode — additional responsibility
+
+- The implementer runs full regression **once**, at the Phase Gate, on the merged feature branch.
+  Run it even though no lane ran it; that is the point.
+- Record the result as evidence in the report. "Not run, no CI" is not a `DONE`.
+- If the suite needs a database or container and the repo documents how to start one, start it,
+  run the suite, and stop it. Note the deviation from the default in the report.
 
 ---
 
@@ -163,7 +199,8 @@ rm -rf "$LOCK"     # $LOCK from the gate above: <git-common-dir>/wt-pool/locks/i
   lock looks dead immediately. Use age (`POOL_STALE_SEC`).
 - 🚫 NEVER forget lock cleanup
 - 🚫 NEVER dispatch a lane, fix-worker, or reviewer without the Verification Scope Contract embedded verbatim in the prompt. Subagents cannot read this skill: with no contract they fall back to the project's AGENTS.md pre-push checklist and run it.
-- 🚫 NEVER let any local participant run full-suite verification (full `pytest`, full frontend test suite, `build`, `react-doctor`, Playwright/browser scripts, smoke runs, contract-verification skills), pull/start/use a local container, or run a database-dependent test. Full regression and database/container-backed checks belong to CI; local work is limited to small-scoped, database-free, container-free gates.
+- 🚫 NEVER let a *worker* run full-suite verification (full `pytest`, full frontend test suite, `build`, `react-doctor`, Playwright/browser scripts, smoke runs, contract-verification skills) or start a container. Workers stay small-scoped in both CI modes — full regression is CI's job when CI exists, and the orchestrator's Phase Gate job when it does not. See the Local Verification Policy for which mode this run is in.
+- 🚫 NEVER assume CI exists. Confirm it before deferring anything to it; deferring to an absent CI leaves the work untested and reported as green.
 
 ---
 
@@ -176,8 +213,9 @@ Subagents see only your prompt plus the repository's `AGENTS.md`. `AGENTS.md` te
 ```
 ## Verification Scope (contract — overrides the repo AGENTS.md pre-push COMMAND list for this task)
 You are a child in an implementer run, not the PR owner. The implementer runs the small-scoped
-pre-PR gate (fast gates + targeted tests) and drives CI to green; CI is the DETECTOR of full
-regression, not a waiver. Nothing here excuses a red PR.
+pre-PR gate (fast gates + targeted tests) and owns full regression — whether that means driving CI
+green or running the suite itself. Full regression is NOT your job in either case. Nothing here
+excuses a red result.
 
 This contract scopes COMMANDS ONLY. It never waives design, audit, privacy, i18n, or
 cross-client contract obligations. A missing required artifact (TS type not synced, i18n key
@@ -274,7 +312,7 @@ Deferred gates: <for each: exact command the implementer must run + why it matte
 5. Self-review
 6. Proceed to Phase Gate, then Phase 2
 
-**Delegation does not move the gate.** Subagents run only what their scope contract allows; you still own the Phase 3 small-scoped verification of the merged result, and CI owns full regression. Never run a full suite locally just because a subagent left it out — that is the designed split, not a gap.
+**Delegation does not move the gate.** Subagents run only what their scope contract allows; you still own the Phase Gate verification of the merged result. Full regression belongs to CI in CI-backed mode, and to you in CI-absent mode — in neither case to a worker. In CI-backed mode, never run a full suite locally just because a subagent left it out; that is the designed split. In CI-absent mode, running it yourself is not a gap in the split — it is your job.
 
 **Reuse lane worktrees.** A lane worktree costs ~145 MB of host writes to create (checkout + dependency bootstrap); reusing one costs ~6 MB, because its ignored `node_modules`/`.venv` trees stay in place. Warm the lane worktrees before dispatching:
 
@@ -452,7 +490,8 @@ Before entering Phase 2, verify:
 - [ ] Every lane: worker completed? Branch has commits? Targeted checks pass?
 - [ ] All lanes merged into feature branch
 - [ ] Small-scoped verification passes on merged result (database-free, container-free targeted
-      checks only; full regression and database/container-backed checks in CI)
+      checks only; full regression follows the run's CI mode — see the Local Verification
+      Policy. Workers never run it in either mode.)
 - [ ] Lane Scope Audit passed: every subagent reported `Checks run:` and `Deferred gates:`, none ran a forbidden check, and every deferred gate has an owner/decision
 - [ ] Lane worktrees KEPT (not removed): `git worktree list` still shows the lane branches, and no worktree was wiped with `git clean -fdx`
 
@@ -497,7 +536,7 @@ For every subagent result (lane, fix-worker, reviewer), before accepting it:
 1. Read the `Checks run:` and `Deferred gates:` lines. **A missing line is itself a violation.**
 2. If `Checks run:` names a forbidden check — full suite runs, `build`, `react-doctor`, Playwright/browser scripts, smoke runs, a chained alias script, a verification skill, a local Docker/Podman/Testcontainers command, or a database-dependent check — record `⚠ SCOPE VIOLATION: <agent> ran <command>`.
 3. Do NOT re-dispatch to "verify properly", and do NOT run the forbidden command yourself on the subagent's behalf. Your targeted checks + the Phase 3 gate + CI already cover it.
-4. **Triage `Deferred gates:` — this is where a lane's honest restraint becomes your work.** Resolve each item to exactly one: (a) CI owns it (a PR-triggered job covers it), (b) you run it at the Phase Gate (no PR-triggered CI job covers it, and it is small-scoped — e.g. the contract check), or (c) record it as residual risk (full-regression class and CI unreachable). A deferred gate nobody picks up is the one failure mode this contract can create, and it lands as a red PR you still own.
+4. **Triage `Deferred gates:` — this is where a lane's honest restraint becomes your work.** Resolve each item to exactly one: (a) CI owns it (a PR-triggered job covers it), (b) you run it at the Phase Gate (no PR-triggered CI job covers it), or (c) record it as residual risk. In CI-backed mode, full-regression-class items resolve to (a); if CI is unreachable they resolve to (c) and the report says so. In CI-absent mode there is no (a) — full-regression items resolve to (b) and you run them. A deferred gate nobody picks up is the one failure mode this contract can create, and it lands as a red PR you still own.
 5. Aggregate violations into `Lane Scope Compliance` and deferred decisions into `Deferred Gates (decisions)`. Repeat offenders within one run mean the dispatch prompt was missing the contract — fix the prompt, not the agent.
 
 ---
@@ -593,8 +632,8 @@ general-purpose worker type.
 
 **Stop conditions** (all must be true):
 - No Critical or Important issues remain
-- Database-free, container-free targeted checks for the changed scope pass (full regression is
-  CI's job, not a round gate)
+- Database-free, container-free targeted checks for the changed scope pass. Full regression is not a
+  round gate: in CI-backed mode CI owns it, in CI-absent mode the Phase Gate does.
 - At least 2 review rounds completed
 
 **Fix-worker dispatch:**
@@ -653,10 +692,16 @@ pnpm --dir web exec vitest run <changed test files>   # targeted and DB/containe
   `pageverify` skill yourself only when it does not pull/start/use a local container or database.
 - Neither applies → record both as residual risk in the report.
 
-**Do NOT run full regression, local containers, or database-dependent tests locally** — full
-`pytest`, full frontend test suite, build, and `react-doctor` are scheduled on CI and verified via
-`gh pr checks`; database/container-backed checks also belong in CI. If ANY allowed local check
-fails: fix, re-run that database-free/container-free check, push.
+**Full regression — depends on the mode established at the start of the run:**
+
+- **CI-backed:** do NOT run full regression, local containers, or database-dependent tests
+  locally. Full `pytest`, full frontend test suite, build, and `react-doctor` are scheduled on CI
+  and verified via `gh pr checks`; database/container-backed checks also belong to CI. If ANY
+  allowed local check fails: fix, re-run that check, push.
+- **CI-absent:** you own full regression and must run it here, once, on the merged feature
+  branch — the full suite plus any build the project documents. Start the database or container
+  if the repo documents how, then stop it. Record the result as evidence. A `DONE` without it is
+  a `DONE` on untested work.
 
 ### Mergeability Preflight (MANDATORY — before every CI wait or poll)
 
@@ -691,7 +736,9 @@ out. If the rebase conflicts in real code, resolve it — do not abort and wait 
 
 **Stop conditions for DONE:**
 - All local small-scoped checks pass
-- GitHub CI checks green on PR (confirmed via `gh pr checks <PR_NUMBER>`) — full regression runs there
+- GitHub CI checks green on PR (confirmed via `gh pr checks <PR_NUMBER>`) — CI-backed mode, full
+  regression runs there. In CI-absent mode instead: you ran the full suite yourself and
+  recorded the result.
 - At least one full CI run completed
 
 **If CI is unreachable after 3 retry attempts**, you may still finish, but only as:
@@ -724,7 +771,7 @@ Local small-scoped checks alone never license a plain `DONE`.
 
 Before reporting:
 - [ ] All acceptance criteria met
-- [ ] Database-free, container-free targeted checks pass locally; full regression and
+- [ ] Verification matches this run's CI mode; full regression and
       database/container-backed tests are covered by CI
 - [ ] Lane Scope Audit done: every subagent reported `Checks run:` and `Deferred gates:`, none ran a forbidden check, and every deferred gate has an owner/decision
 - [ ] CI green on PR (`gh pr checks` confirmed) — or the report carries `DONE (CI unavailable)` + `Full regression: NOT RUN`
@@ -776,6 +823,7 @@ Before reporting:
 
 ### CI Status
 All checks green on PR <NUMBER> (confirmed with `gh pr checks`); full regression ran on CI.
+In CI-absent mode instead: no PR CI covers full regression, so it was run locally — <result>.
 If CI was unreachable: `Full regression: NOT RUN — CI unreachable (<error>)`; local full tests,
 containers, and database-dependent tests are prohibited, so leave the PR open and state that
 explicitly. Status is `DONE (CI unavailable)`.

@@ -27,6 +27,16 @@ cp -r implementer .claude/skills/implementer
 
 ## What it enforces
 
+**A verification mode, established before dispatching anything.** The skill first determines
+whether the repository has CI that runs on pull requests, and states which it is in one line. With
+CI, full regression is forbidden locally — it duplicates work that already runs, and on a large repo
+it costs far more time than it saves. Without CI, the implementer runs the full suite itself at the
+Phase Gate, because otherwise it never runs and the PR ships untested. An unstated assumption here is
+how a repo ends up with green PRs that were never actually tested.
+
+Either way, workers stay scoped. Full regression belongs to CI when it exists and to the orchestrator
+when it does not — never to a lane, in both modes.
+
 **An exclusive lock, first thing.** A `.pi-implementer.lock` claim under the pool anchor, taken
 before any work and released on every exit path. Without it two implementers interleave on one
 repository.
