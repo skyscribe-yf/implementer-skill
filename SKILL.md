@@ -7,13 +7,14 @@ disable-model-invocation: true
 # Implementer Subagent Workflow
 
 ## Overview
-Self-contained implementation subagent with review-fix loop and CI-gated PR creation. Implements a task, runs a parallel five-angle review (correctness & regressions, tests & validation, simplicity & maintainability, security & privacy, contracts & project compliance), delegates fixes to worker subagents, creates a PR, and loops on CI failures until green or max retries.
+Self-contained implementation subagent with review-fix loop and CI-gated PR creation. Claims the GitHub issue (assignee + `inprogress`) before any work so multiple people never build the same issue twice; implements a task, runs a parallel five-angle review (correctness & regressions, tests & validation, simplicity & maintainability, security & privacy, contracts & project compliance), delegates fixes to worker subagents, creates a PR, and loops on CI failures until green or max retries.
 
 ## When to Use
 - Medium-to-large feature implementation requiring structured review
 - Multi-lane parallel work that needs integration
 - Changes requiring CI-gated PR creation
 - Tasks where the orchestrator should NOT write code itself
+- Picking work from a shared issue backlog while other people work the same repo in parallel
 
 ## When NOT to Use
 - Pure investigation or documentation tasks
@@ -81,11 +82,113 @@ mid-run, report `DONE (CI unavailable)` and keep the PR open rather than filling
 
 ---
 
-## ABSOLUTE FIRST ACTION — EXCLUSIVE LOCK GATE
+## ABSOLUTE FIRST ACTIONS — CLAIM THE ISSUE, THEN TAKE THE LOCK
 
-**STOP. Do not proceed until this gate passes.**
+Two claims, in this order, before any implementation work:
 
-### Resolve the lock path first
+- **Step 0 — Claim the GitHub issue.** The assignee + `inprogress` label are the *cross-person*
+  lock: they live on GitHub, so every teammate, on every machine, sees them.
+- **Step 1 — Take the local lock.** The `.git`-anchored lock is the *same-clone* lock: it
+  serializes implementers that share one checkout. It is invisible to people working in their own
+  clones, which is exactly why Step 0 exists — neither step replaces the other.
+
+Skipping Step 0 is how two people build the same issue twice. Skipping Step 1 is how two sessions
+in one clone interleave on one branch.
+
+### Step 0 — Claim the issue on GitHub (do this FIRST)
+
+**Resolve the issue number** from the task text, the branch name, or a `fixes #N` / `#N`
+reference. If the run has no issue reference (local task, exploratory work), skip Step 0 and say
+so in the report — never invent an issue.
+
+**Read before you touch.** Settle the state first:
+
+```bash
+ISSUE_NUM=<from the task text, branch name, or PR body>
+gh issue view "$ISSUE_NUM" --json number,title,state,assignees,labels \
+  --jq '{n:.number,title:.title,state:.state,assignees:[.assignees[].login],labels:[.labels[].name]}'
+```
+
+Resolve in this order:
+
+| Observed state | Action |
+| --- | --- |
+| `CLOSED` | STOP — do not reopen or work around it. Report `BLOCKED` with the issue state. |
+| Assigned to **someone else** | STOP — do not steal. Report `BLOCKED`: "issue #N is assigned to <login>." Take a different issue, or proceed only if the user explicitly hands this one over. |
+| An **open PR** already targets it (best-effort check below) | STOP — report the PR URL; someone is already on it. |
+| Assigned to **you** already | Idempotent re-run: make sure the `inprogress` label is present, then proceed. |
+| **Unassigned** | Claim it (below). |
+
+Best-effort duplicate check — branch names usually embed the issue number; the assignee check is
+authoritative when this cannot answer:
+
+```bash
+gh pr list --state open --limit 100 --json number,headRefName,title \
+  | grep -E "(^|[^0-9])${ISSUE_NUM}([^0-9]|$)" || true
+```
+
+**Claim it:**
+
+```bash
+gh issue edit "$ISSUE_NUM" --add-assignee @me
+gh issue edit "$ISSUE_NUM" --add-label inprogress 2>/dev/null || echo "⚠ label 'inprogress' unavailable"
+gh issue view "$ISSUE_NUM" --json assignees,labels \
+  --jq '{assignees:[.assignees[].login],labels:[.labels[].name]}'
+```
+
+Re-read after writing: if a **different** login now shows as assignee, you lost a race — back off,
+report it, and take another issue. Never keep working on an issue someone else holds.
+
+Claim failed (no `gh`, no permission, offline)? Warn loudly and continue, but record
+`Issue claim: FAILED — <reason>` in the report. It must never be silently skipped.
+
+**Release the claim when the run ends** — on every exit path (DONE / BLOCKED / NEEDS_CONTEXT),
+the same rule as the lock:
+
+```bash
+gh issue edit "$ISSUE_NUM" --remove-label inprogress 2>/dev/null || true
+# Keep the assignee: it is the record of who owns the follow-up.
+```
+
+### Picking work when nobody named an issue (default: take what others have NOT picked)
+
+When the user asks you to choose ("pick an issue", "next piece of work"), never start from the top
+of the list. Prefer issues **nobody has claimed**:
+
+```bash
+# Unassigned AND not labeled inprogress — the free work, in the repo's own board order
+gh issue list --state open --limit 50 --json number,title,assignees,labels \
+  --jq '.[]
+       | select((.assignees | length) == 0)
+       | select(([.labels[].name] | index("inprogress")) == null)
+       | "\(.number)\t\(.title)"'
+```
+
+- Skip anything assigned to someone else or labeled `inprogress` — that is another person's
+  work in flight, even when it looks stalled.
+- If the user explicitly names a claimed issue, confirm before taking it; their "yes" is the
+  takeover authorization this skill requires.
+- Claim (Step 0) before you plan, and only then start Step 1.
+
+### Coordination model — what protects what
+
+| Surface | Scope | Mechanism |
+| --- | --- | --- |
+| Issue ownership | Whole team, every machine | GitHub assignee + `inprogress` label (Step 0) |
+| Concurrent sessions in one clone | This checkout only | Implementer lock + `pool-take.sh` slot claims (Step 1) |
+| Branch ownership | Whole team | A PR branch belongs to its author. Never push to, rebase, or force-push a branch you did not create — including a teammate's lane branch. |
+| Warm worktree pool | This clone only | Slots under `<repo>/.git/wt-pool/`. A teammate's clone has its own pool; there is nothing to coordinate across clones. |
+
+If mid-run you discover the issue is now claimed by someone else (a new assignee, a PR appeared),
+stop and report it — do not race them to the PR.
+
+---
+
+### Step 1 — Take the exclusive local lock (same-clone coordination)
+
+**STOP. Do not proceed until both claims have landed.**
+
+#### Resolve the lock path first
 
 The lock lives under the **git-common-dir anchor**, NOT in the working directory.
 Never hardcode `.pi-implementer.lock` relative to `$PWD`: when the harness runs you
@@ -105,7 +208,7 @@ This makes the lock **per git project**: the main checkout and every worktree of
 that repo share it; two unrelated repos never see each other. Set
 `WT_ANCHOR_DISABLE=1` to fall back to the legacy `<toplevel>/.worktrees` layout.
 
-### Check for an existing lock
+#### Check for an existing lock
 
 ```bash
 if [ -f "$LOCK" ]; then
@@ -149,27 +252,10 @@ EOF
 Nothing needs a `.gitignore` entry: the lock sits inside `.git/`, which git never
 tracks or syncs.
 
-**Immediately after acquiring the lock, mark any linked issue/PR as in-progress** so other agents do not pick up the same work:
-
-```bash
-ISSUE_NUM=$(git branch --show-current | grep -oP '\d{2,}' | head -1)
-if [ -z "$ISSUE_NUM" ]; then
-  ISSUE_NUM=$(grep '^task=' "$LOCK/claim" | grep -oP '\d{2,}' | head -1)
-fi
-if [ -n "$ISSUE_NUM" ]; then
-  if gh issue view "$ISSUE_NUM" >/dev/null 2>&1; then
-    gh issue edit "$ISSUE_NUM" --add-label "inprogress" 2>/dev/null \
-      && echo "✓ Marked issue #$ISSUE_NUM as inprogress" \
-      || echo "⚠ Could not label issue #$ISSUE_NUM"
-  elif gh pr view "$ISSUE_NUM" >/dev/null 2>&1; then
-    gh pr edit "$ISSUE_NUM" --add-label "inprogress" 2>/dev/null \
-      && echo "✓ Marked PR #$ISSUE_NUM as inprogress" \
-      || echo "⚠ Could not label PR #$ISSUE_NUM"
-  else
-    echo "⚠ Could not find issue/PR #$ISSUE_NUM"
-  fi
-fi
-```
+**After acquiring the lock, confirm Step 0 happened.** If there is an issue reference, it must
+already be assigned to you and labeled `inprogress` (Step 0). If there is no issue reference,
+that is expected — say so in the report. Do not mark PRs `inprogress` here; Step 0 owns the
+GitHub-side claim.
 
 **Lock cleanup (MANDATORY):** Remove the lock before reporting — regardless of outcome.
 
@@ -192,15 +278,26 @@ rm -rf "$LOCK"     # $LOCK from the gate above: <git-common-dir>/wt-pool/locks/i
 - 🚫 NEVER overtake subagent work — if an `Agent` is running, do NOT edit code yourself
 - 🚫 NEVER poll subagents in a loop. Dispatch with `run_in_background=true`, wait for automatic completion notification, or use ONE `TaskOutput` check after expected duration
 - 🚫 NEVER start without acquiring the lock first
+- 🚫 NEVER start work on an issue that is assigned to **someone else** — a takeover needs
+  explicit user authorization. The assignee field is the cross-person claim; a stale-looking
+  assignment is still a person's work in flight.
+- 🚫 NEVER skip Step 0 on a task that references an issue: claim the assignee + `inprogress`
+  label, or report who already holds it. A run that cannot claim must record
+  `Issue claim: FAILED — <reason>` in the report.
+- 🚫 NEVER push to, rebase, or force-push a branch you did not create — that includes a
+  teammate's branch, not just another agent's.
 - 🚫 NEVER write any lock file relative to `$PWD` — harness-managed worktree directories are
   discarded after the run, so a `$PWD` lock is invisible to every later run. Always resolve it
   through `wt-anchor.sh` (`wt_lock_file`).
 - 🚫 NEVER judge lock staleness by PID liveness — orchestrator shells are short-lived, so every
   lock looks dead immediately. Use age (`POOL_STALE_SEC`).
 - 🚫 NEVER forget lock cleanup
+- 🚫 NEVER forget to release the GitHub claim (`inprogress` label) on exit — keep the assignee.
 - 🚫 NEVER dispatch a lane, fix-worker, or reviewer without the Verification Scope Contract embedded verbatim in the prompt. Subagents cannot read this skill: with no contract they fall back to the project's AGENTS.md pre-push checklist and run it.
 - 🚫 NEVER let a *worker* run full-suite verification (full `pytest`, full frontend test suite, `build`, `react-doctor`, Playwright/browser scripts, smoke runs, contract-verification skills) or start a container. Workers stay small-scoped in both CI modes — full regression is CI's job when CI exists, and the orchestrator's Phase Gate job when it does not. See the Local Verification Policy for which mode this run is in.
 - 🚫 NEVER assume CI exists. Confirm it before deferring anything to it; deferring to an absent CI leaves the work untested and reported as green.
+- 🚫 NEVER report DONE while the branch is behind base, or with conflict markers left in the
+  working tree — sync (Phase 2.5), re-verify, then report.
 
 ---
 
@@ -657,6 +754,67 @@ regression and database/container-backed checks run in CI — do not run them he
 
 ---
 
+## Phase 2.5: Pre-CI Base Sync (MANDATORY GATE)
+
+**Before creating the PR or entering the CI loop, sync the feature branch with the latest base.**
+An out-of-sync branch is the #1 avoidable cause of red CI: the suite that runs against the PR
+tests the *merge* of your branch with a base that moved under you.
+
+### Sync procedure
+
+```bash
+BASE_BRANCH=$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')
+git fetch origin "$BASE_BRANCH"
+git merge "origin/$BASE_BRANCH" --no-edit
+```
+
+Pre-PR sync is a **merge**, not a rebase: it needs no force-push and no history rewrite, so it is
+always safe here. (After the PR exists, the Mergeability Preflight in Phase 3 may rebase your own
+head branch instead — that is the pre-authorized alternative when the merge ref is unbuildable.)
+
+### Check 1: Merge conflicts
+
+```bash
+git diff --name-only --diff-filter=U     # non-empty → conflicts
+```
+
+Resolution strategy:
+1. Read both sides before choosing; resolve per file.
+2. Additive conflicts (both sides added imports/config in different places) → take both.
+3. One-sided conflicts (only base changed, your side is untouched) → take base.
+4. Semantic conflicts (the same function changed differently) → prefer base for shared
+   infrastructure, your side for feature-specific logic.
+5. Generated artifacts (API docs, fixture collections, secrets baselines, lockstep fixtures) are
+   **re-generated with their owning script**, never hand-merged.
+6. Too complex or ambiguous to resolve safely → do NOT guess. Report `BLOCKED` with the file
+   list and both versions.
+
+### Check 2: Semantic drift
+
+Even a clean merge can break the branch: a signature changed on base, a dependency was removed, a
+test helper was renamed. Re-run the small-scoped checks (below) after every sync; if the sync
+introduced failures, fix them like any code bug (a fix-worker is fine).
+
+### Check 3: Small-scoped verification after sync
+
+Database-free, container-free targeted checks only (see Phase 3 for the command list) — full
+regression, local containers, and database-dependent tests stay with CI (CI-backed) or the
+orchestrator (CI-absent).
+
+### Gate checklist
+
+```
+□ Phase 2.5 GATE — verify before Phase 3:
+□ git fetch origin <base> completed
+□ git merge origin/<base> — conflicts resolved (if any), sync committed
+□ Small-scoped verification passes after the sync
+□ Branch is NOT behind base: git rev-list --count HEAD..origin/<base> = 0
+```
+
+Any item failing? Do not proceed to Phase 3. Fix it first.
+
+---
+
 ## Phase 3: PR & CI Loop
 
 ### PR Creation
@@ -760,8 +918,49 @@ Local small-scoped checks alone never license a plain `DONE`.
 5. If the wait ends with zero checks, or with checks that never attach to the current head → go back to step 2 (conflict signature, not an outage)
 6. If unreachable after 3 tries → follow the CI-unavailable rule above
 7. If all green → proceed
-8. If red → get logs (`gh run view <RUN_ID> --log-failed`), fix, push, repeat
+8. If red → **triage first** (below), fix, push, repeat
 9. If CI fails 3+ times on same job → report BLOCKED
+
+### CI Failure Triage (before you touch code)
+
+A red check is not automatically a code bug. Classify it first:
+
+```bash
+# Step 1: is the branch behind base?
+BASE_BRANCH=$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')
+git fetch origin "$BASE_BRANCH" >/dev/null 2>&1
+BEHIND=$(git rev-list --count HEAD.."origin/$BASE_BRANCH" 2>/dev/null || echo 0)
+echo "behind=$BEHIND"
+# Step 2: read the failure
+gh run view <RUN_ID> --log-failed
+```
+
+| Category | Indicator | Action |
+| --- | --- | --- |
+| **[A] Out-of-sync** | branch is behind base; failures sit in areas you never touched | Sync (merge `origin/<base>`, Phase 2.5) → push → re-check. Do **not** "fix" code. |
+| **[B] Merge conflict** | merge produces conflict markers | Resolve per Phase 2.5, or report BLOCKED. Do not dispatch a fix-worker. |
+| **[C] Code bug (your change)** | failures are in files you changed; branch is up to date | Diagnose from the logs, fix (fix-worker is fine), push, re-check. |
+| **[D] Infrastructure** | runner deaths, timeouts, network errors | `gh run rerun <RUN_ID> --failed`, then re-check. |
+| **[E] Third-party / dependency** | a new upstream version or API change broke the job | Report BLOCKED with the evidence. Do not code around it. |
+
+### Final gate — before reporting DONE
+
+```bash
+# 1. Branch must not be behind base (a green-then-stale branch is not DONE)
+BASE_BRANCH=$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')
+git fetch origin "$BASE_BRANCH" >/dev/null 2>&1
+BEHIND=$(git rev-list --count HEAD.."origin/$BASE_BRANCH" 2>/dev/null || echo 0)
+[ "$BEHIND" -eq 0 ] || echo "BLOCKED: branch is $BEHIND behind — run the Phase 2.5 sync"
+
+# 2. No stale conflict markers anywhere in the tree
+grep -rnE '^(<<<<<<<|=======|>>>>>>>)' \
+  --include='*.py' --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
+  . 2>/dev/null
+```
+
+Either check failing → fix (sync; resolve the markers) and re-verify; if the sync conflicts are
+not safely resolvable, report `BLOCKED`. Never report DONE on a stale branch or with markers
+left behind.
 
 ---
 
@@ -771,16 +970,27 @@ Local small-scoped checks alone never license a plain `DONE`.
 
 Before reporting:
 - [ ] All acceptance criteria met
+- [ ] **Issue claim settled**: issue assigned to you; `inprogress` released on exit (or
+      `Issue claim: FAILED — <reason>` recorded); no issue reference → stated in the report
 - [ ] Verification matches this run's CI mode; full regression and
       database/container-backed tests are covered by CI
 - [ ] Lane Scope Audit done: every subagent reported `Checks run:` and `Deferred gates:`, none ran a forbidden check, and every deferred gate has an owner/decision
 - [ ] CI green on PR (`gh pr checks` confirmed) — or the report carries `DONE (CI unavailable)` + `Full regression: NOT RUN`
 - [ ] Mergeability preflight clean: `mergeable=MERGEABLE` and checks attached to the current head SHA (no "waiting on a conflicted PR" state was reported as progress)
+- [ ] Branch is not behind base: `git rev-list --count HEAD..origin/<base>` = 0
+- [ ] No leftover conflict markers (`grep -rnE '^(<<<<<<<|=======|>>>>>>>)'`)
 - [ ] No TODO/FIXME/HACK left (unless noted)
-- [ ] Follows project conventions (AGENTS.md)
+- [ ] Follows project conventions (AGENTS.md); new files sit in the right directory
 - [ ] No unnecessary changes outside task scope
 - [ ] Error handling covers edge cases
 - [ ] No hardcoded values that should be configurable
+
+### Code Organization
+
+- Follow existing project patterns and directory structure.
+- Keep changes minimal and focused on the task.
+- New files go into the directory their role implies, following existing conventions.
+- Significant restructuring is outside a task's scope — flag it for the orchestrator instead.
 
 ### When to Escalate
 
@@ -790,6 +1000,9 @@ Before reporting:
 - Stuck after 3+ attempts on same issue
 - CI fails 3+ times on same job
 - Missing prerequisite dependency
+- The issue is assigned to another person, or an open PR already targets it (Step 0)
+- The branch cannot be synced with base (conflicts too complex), or stale conflict markers cannot
+  be cleared
 - A conflicted PR is **never** BLOCKED: it is a rebase. Run the Mergeability Preflight, resolve it, keep going.
 
 **NEEDS_CONTEXT:**
@@ -821,12 +1034,17 @@ Before reporting:
 ### PR
 <URL or N/A>
 
+### Issue Claim
+`#<N>: assignee=@me, inprogress released on exit` | `#<N>: FAILED — <reason>` | `no issue reference`
+(If the issue was already assigned to someone else and you stopped: say so and name the login.)
+
 ### CI Status
 All checks green on PR <NUMBER> (confirmed with `gh pr checks`); full regression ran on CI.
 In CI-absent mode instead: no PR CI covers full regression, so it was run locally — <result>.
 If CI was unreachable: `Full regression: NOT RUN — CI unreachable (<error>)`; local full tests,
 containers, and database-dependent tests are prohibited, so leave the PR open and state that
 explicitly. Status is `DONE (CI unavailable)`.
+Branch synced: `git rev-list --count HEAD..origin/<base>` = 0; no conflict markers left.
 
 ### Test Results
 <summary>
@@ -846,8 +1064,36 @@ explicitly. Status is `DONE (CI unavailable)`.
 - Verbose test output
 - Internal details unless they affect orchestrator decisions
 
-**LOCK CLEANUP (MANDATORY):**
+**CLEANUP (MANDATORY — on every exit path, DONE / BLOCKED / NEEDS_CONTEXT):**
+
 ```bash
-rm -f .pi-implementer.lock
+rm -rf "$LOCK"    # the git-anchored lock from Step 1 — never a $PWD-relative path
+# Release the GitHub claim (Step 0) too; keep the assignee:
+gh issue edit "$ISSUE_NUM" --remove-label inprogress 2>/dev/null || true
 ```
-Do this before delivering the report, regardless of status.
+
+Do this before delivering the report, regardless of status. The next run — yours or a
+teammate's — must see a free lock and an unlabeled issue.
+
+---
+
+## Orchestrator Contract (for reference)
+
+The orchestrator that dispatched you follows these rules. If you observe violations, note them in
+your report:
+
+- It reads your report and decides next steps; it will NOT modify your branch directly.
+- It may re-dispatch you with additional context if you report BLOCKED/NEEDS_CONTEXT.
+- It handles merging your PR after review; it expects you to be self-sufficient within your task.
+- **The orchestrator is NEVER a worker.** It must not write code, edit files, resolve merge
+  conflicts, or create commits. When artifacts from multiple subagents need integration, it
+  delegates to a single subagent — never merges branches itself.
+- **Multi-lane features use ONE implementer.** It must never launch multiple implementer
+  instances for parallel lanes of the same feature; one implementer owns the feature and fans out
+  worker subagents internally (Phase 1a).
+- **One issue, one implementer.** The GitHub assignee (Step 0) arbitrates ownership; the
+  orchestrator must not dispatch a second run for an issue already assigned to someone else, and
+  a takeover requires explicit user confirmation.
+- **Stale lock handling.** If an implementer reports BLOCKED due to a stale lock, the orchestrator
+  asks the user whether to remove it before re-dispatching. Do NOT silently remove the lock — the
+  user may know why it exists (e.g. a paused or hibernated session).

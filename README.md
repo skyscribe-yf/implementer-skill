@@ -3,8 +3,9 @@
 An agent skill for implementing a feature or bugfix behind a self-contained subagent: it plans the
 work, fans out lanes, runs a five-angle review, loops on fixes, and gates the result on CI.
 
-[`SKILL.md`](SKILL.md) is the skill itself — that is what your agent reads, and it is the file to
-install. This README explains what the skill enforces and why.
+[`SKILL.md`](SKILL.md) is the source of truth — the canonical skill body your agent reads.
+`sync.sh` installs it to every platform location. This README explains what the skill enforces
+and why.
 
 The defining constraint is that the orchestrator does not write code. It plans, dispatches, audits
 scope, and merges — but implementation happens in workers whose verification is explicitly scoped so
@@ -12,18 +13,55 @@ they cannot quietly run a full regression suite.
 
 ## Install
 
-The skill directory is the unit of installation. Copy it wherever your agent looks for skills:
+The canonical body lives in `SKILL.md`; the pi and Codex variants are assembled from it plus
+`platform/<name>/{header,appendix}.md`. Install all three copies with one command:
 
 ```bash
-# Claude Code
-cp -r implementer ~/.claude/skills/implementer
-
-# Pi
-cp -r implementer ~/.pi/agents/skills/implementer
-
-# or a project-local copy
-cp -r implementer .claude/skills/implementer
+./sync.sh            # install + verify
+./sync.sh --check    # verify only: proves every installed copy carries the same body
+./sync.sh --dry-run  # print targets
 ```
+
+| Target | What lands there |
+| --- | --- |
+| `~/.agents/skills/implementer/` | `SKILL.md` + the five shell scripts (generic agents: Claude Code, DimCode, …) |
+| `~/.pi/agent/agents/implementer.md` | pi agent spec (frontmatter from `platform/pi/header.md`, dispatch notes appended) and `implementer-reference.md` |
+| `~/.codex/skills/codex-implementation-loop/SKILL.md` | Codex skill — same protocol, Codex-native controls appended |
+
+Each assembled copy marks the shared body with `BEGIN/END canonical body` comments, and
+`--check` hashes it against `SKILL.md`. Edit the canonical files and re-run `sync.sh`; never edit
+an installed copy — that is how the three copies drifted apart before.
+
+## Multi-person coordination
+
+Two claims happen before any work, in this order:
+
+- **Step 0 — claim the GitHub issue.** `gh issue edit <N> --add-assignee @me --add-label
+  inprogress`. The assignee + label are the *cross-person* lock: they live on GitHub, so every
+  teammate on every machine sees them. An issue assigned to someone else is a stop, not a
+  suggestion; a takeover needs explicit user authorization. The label is released on every exit
+  path, the assignee is kept as the record of ownership.
+- **Step 1 — take the local lock.** The `.git`-anchored implementer lock serializes sessions that
+  share one clone. It cannot coordinate across people, which is why Step 0 exists.
+
+When the agent picks its own work, it prefers issues **nobody has claimed** (no assignee, no
+`inprogress` label) and skips anything in flight for someone else:
+
+```bash
+gh issue list --state open --limit 50 --json number,title,assignees,labels \
+  --jq '.[] | select((.assignees|length)==0)
+       | select(([.labels[].name] | index("inprogress")) == null)
+       | "\(.number)\t\(.title)"'
+```
+
+What protects what:
+
+| Surface | Scope | Mechanism |
+| --- | --- | --- |
+| Issue ownership | whole team, every machine | GitHub assignee + `inprogress` label |
+| Concurrent sessions in one clone | that checkout only | implementer lock + `pool-take.sh` slot claims |
+| Branch ownership | whole team | a PR branch belongs to its author — never push to or rebase a branch you did not create |
+| Warm worktree pool | that clone only | `<repo>/.git/wt-pool/`; clones each have their own |
 
 ## What it enforces
 
@@ -37,9 +75,15 @@ how a repo ends up with green PRs that were never actually tested.
 Either way, workers stay scoped. Full regression belongs to CI when it exists and to the orchestrator
 when it does not — never to a lane, in both modes.
 
-**An exclusive lock, first thing.** A `.pi-implementer.lock` claim under the pool anchor, taken
-before any work and released on every exit path. Without it two implementers interleave on one
-repository.
+**An exclusive lock, first thing — after the issue claim.** A `.pi-implementer.lock`-style claim
+under the git-common-dir pool anchor, taken before any work and released on every exit path.
+Without it two implementers interleave on one repository; without the GitHub claim (Step 0), two
+*people* interleave on one issue.
+
+**A pre-CI base sync and a post-CI final gate.** Phase 2.5 merges the latest base before the PR
+exists (an out-of-sync branch is the #1 avoidable red CI), and before DONE the branch must not be
+behind base and must contain no leftover conflict markers. A CI failure is triaged first
+(out-of-sync / conflict / code bug / infra / upstream) instead of being "fixed" blindly.
 
 **A verification scope contract in every dispatch.** Workers see only their prompt plus the
 repository's `AGENTS.md`, and `AGENTS.md` tells every agent to run the full pre-push checklist. A
@@ -95,7 +139,7 @@ every worktree of that repo, and differs between unrelated clones, so reuse and 
 | `wt-migrate-anchor.sh` | One-time move from an older `<toplevel>/.worktrees/pool/` layout. |
 
 ```bash
-POOL="$HOME/.claude/skills/implementer"
+POOL="$HOME/.agents/skills/implementer"
 slot=$("$POOL/pool-take.sh" lane-a "implement issue 1234")
 # hand $slot to the worker as its working directory
 "$POOL/pool-release.sh" lane-a
