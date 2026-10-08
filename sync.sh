@@ -6,9 +6,10 @@
 #   ~/.agents/skills/implementer/                      generic agents (Claude Code / DimCode / …)
 #   ~/.pi/agent/agents/implementer.md                  pi agent spec (+ implementer-reference.md)
 #   ~/.codex/skills/codex-implementation-loop/SKILL.md Codex skill
+#   ~/.agents/skills/implementer-pasee/SKILL.md         Paseo runtime (workspace/agent model)
 #
 # The canonical body is delimited by BEGIN/END markers in every assembled copy, so --check can
-# prove all three installs carry byte-identical logic. Edit SKILL.md or the platform files, then
+# prove all installs carry byte-identical logic. Edit SKILL.md or the platform files, then
 # re-run this script — never edit an installed copy.
 #
 # Usage: ./sync.sh [--check] [--dry-run]
@@ -24,6 +25,8 @@ PI_DIR="${PI_DIR:-$HOME/.pi/agent/agents}"
 PI_AGENT="$PI_DIR/implementer.md"
 PI_REF="$PI_DIR/implementer-reference.md"
 CODEX_SKILL="${CODEX_SKILL:-$HOME/.codex/skills/codex-implementation-loop/SKILL.md}"
+PASEO_DIR="${PASEO_DIR:-$HOME/.agents/skills/implementer-pasee}"
+PASEO_SKILL="$PASEO_DIR/SKILL.md"
 
 die() { echo "error: $*" >&2; exit 1; }
 [ -f "$SRC" ] || die "SKILL.md not found in $ROOT"
@@ -55,6 +58,7 @@ assemble() { # header.md appendix.md -> stdout  (body must round-trip byte-ident
 install_generic() {
   mkdir -p "$GENERIC_DIR"
   cp "$SRC" "$GENERIC_DIR/SKILL.md"
+  cp "$ROOT"/REFERENCE.md "$GENERIC_DIR/REFERENCE.md"
   cp "$ROOT"/pool-take.sh "$ROOT"/pool-release.sh \
      "$ROOT"/wt-anchor.sh "$ROOT"/wt-pool.sh "$ROOT"/wt-migrate-anchor.sh "$GENERIC_DIR/"
   chmod +x "$GENERIC_DIR"/*.sh
@@ -72,6 +76,14 @@ install_codex() {
   mkdir -p "$(dirname "$CODEX_SKILL")"
   assemble "$ROOT/platform/codex/header.md" "$ROOT/platform/codex/appendix.md" > "$CODEX_SKILL"
   echo "→ $CODEX_SKILL"
+}
+
+# Paseo 装成独立 skill 而非 pi agent spec：它的 frontmatter 语义是 user-invocable
+# skill，不是 agent 定义。池脚本仍从 generic 目录取，不重复安装一份。
+install_paseo() {
+  mkdir -p "$PASEO_DIR"
+  assemble "$ROOT/platform/paseo/header.md" "$ROOT/platform/paseo/appendix.md" > "$PASEO_SKILL"
+  echo "→ $PASEO_SKILL"
 }
 
 check_one() { # label file
@@ -95,18 +107,54 @@ check_all() {
   check_one "generic" "$GENERIC_DIR/SKILL.md" || rc=1
   check_one "pi" "$PI_AGENT" || rc=1
   check_one "codex" "$CODEX_SKILL" || rc=1
+  check_one "paseo" "$PASEO_SKILL" || rc=1
   [ -f "$PI_REF" ] && echo "✓ pi reference present" || { echo "✗ pi reference missing: $PI_REF"; rc=1; }
+  check_model_policy || rc=1
+  return $rc
+}
+
+CODEX_CONFIG="${CODEX_CONFIG:-$HOME/.codex/config.toml}"
+CODEX_AGENTS_DIR="${CODEX_AGENTS_DIR:-$HOME/.codex/agents}"
+
+# Banned tiers: gpt-6-astra / gpt-5.6-sol cost 5x+ the luna/terra tier and leaked into every
+# implementer lane, because unnamed spawns inherit [agents] default_subagent_model while named
+# agents pin model in ~/.codex/agents/*.toml. Both places are checked so a one-line edit can't
+# silently re-arm the expensive fallback.
+check_model_policy() {
+  local rc=0 hits f
+  local re='^[[:space:]]*(default_subagent_)?model[[:space:]]*=.*(gpt-6-astra|gpt-5\.6-sol)'
+  if [ -f "$CODEX_CONFIG" ]; then
+    hits="$(grep -nE "$re" "$CODEX_CONFIG" || true)"
+    if [ -n "$hits" ]; then
+      echo "✗ codex model policy — banned model in $CODEX_CONFIG:"
+      printf '%s\n' "$hits"
+      rc=1
+    else
+      echo "✓ codex default_subagent_model off the banned tiers"
+    fi
+  else
+    echo "• codex model policy — skipped: no $CODEX_CONFIG"
+  fi
+  for f in "$CODEX_AGENTS_DIR"/*.toml; do
+    [ -f "$f" ] || continue
+    hits="$(grep -nE "$re" "$f" || true)"
+    if [ -n "$hits" ]; then
+      echo "✗ codex model policy — banned model in $f:"
+      printf '%s\n' "$hits"
+      rc=1
+    fi
+  done
   return $rc
 }
 
 case "${1:-}" in
   "")
-    install_generic; install_pi; install_codex
+    install_generic; install_pi; install_codex; install_paseo
     echo
     check_all
     ;;
   --dry-run)
-    echo "would install: $GENERIC_DIR/, $PI_AGENT, $PI_REF, $CODEX_SKILL"
+    echo "would install: $GENERIC_DIR/, $PI_AGENT, $PI_REF, $CODEX_SKILL, $PASEO_SKILL"
     ;;
   --check)
     check_all

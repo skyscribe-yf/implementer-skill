@@ -25,9 +25,16 @@ CI gates — is the single logic on every platform.
 
 ### Roles and model policy
 
-- Read-only mapping / context → `lean-explorer` (`gpt-5.6-luna`, reasoning `medium`).
-- Lanes and fix-workers → `lean-worker` (`gpt-5.6-terra`, reasoning `high`).
-- Reviewers → `lean-reviewer` (`gpt-5.6-terra`, reasoning `xhigh`).
+- Read-only mapping / context → `lean-explorer`.
+- Lanes and fix-workers → `lean-worker`.
+- Reviewers → `lean-reviewer`.
+
+The model lives in the agent TOML (`~/.codex/agents/*.toml`), not in this file — current pins are
+`ollama-cloud/deepseek-v4-flash:0731` at reasoning `max`. The dangerous path is **unnamed spawns**
+(`agent_type: "default"`/`"worker"`): they ignore the TOMLs and inherit `[agents]
+default_subagent_model` from `~/.codex/config.toml`, which is how `gpt-6-astra` got billed for every
+lane. Keep that key on `gpt-6.1-sol` (cheaper tiers like luna are too weak for lanes);
+`./sync.sh --check` fails if it or any agent TOML pins `gpt-6-astra` or `gpt-5.6-sol`.
 
 `lean-explorer` and `lean-reviewer` always use `fork_context = false`; give them a focused scope
 plus acceptance criteria and a diff reference. `lean-worker` starts with `fork_context = false`;
