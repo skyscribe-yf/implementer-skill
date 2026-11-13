@@ -144,6 +144,37 @@ check_model_policy() {
       rc=1
     fi
   done
+  check_pi_model_policy || rc=1
+  return $rc
+}
+
+# pi carries no banned-tier list like codex, but it has the opposite failure: an agent-level
+# `model:` overrides the session default, so a provider that is outside the account's usage
+# plan 402s at dispatch while the orchestrator's own model keeps working (#4338: ollama-cloud).
+# Both the canonical header and the installed copy are checked so a re-sync can't re-arm it.
+PI_BANNED_PROVIDERS="${PI_BANNED_PROVIDERS:-ollama-cloud}"
+
+check_pi_model_policy() {
+  local rc=0 f line
+  for f in "$ROOT/platform/pi/header.md" "$PI_AGENT"; do
+    if [ ! -f "$f" ]; then
+      echo "✗ pi model policy — missing $f"
+      rc=1
+      continue
+    fi
+    line="$(grep -m1 -E '^model:[[:space:]]*' "$f" || true)"
+    if [ -z "$line" ]; then
+      echo "✗ pi model policy — no model: line in $f"
+      rc=1
+    elif printf '%s' "$line" | grep -qE "($PI_BANNED_PROVIDERS)"; then
+      echo "✗ pi model policy — $f pins a provider outside this account's usage plan:"
+      echo "  $line"
+      echo "  fix: point model: at an available provider (banned: $PI_BANNED_PROVIDERS)"
+      rc=1
+    else
+      echo "✓ pi model policy — $f pins $line"
+    fi
+  done
   return $rc
 }
 

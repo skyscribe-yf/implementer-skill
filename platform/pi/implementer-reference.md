@@ -8,13 +8,13 @@ copies cannot drift.
 
 | Provider/Model | Strength | Cost | Good for |
 |---|---|---|---|
-| `ollama-cloud/deepseek-v4.1-flash` | Fast reasoning | $ | All review roles (spec compliance, architecture, code quality, re-reviews, round rotation) |
+| `inherit` (orchestrator's current model) | — | — | All review roles (spec compliance, architecture, code quality, re-reviews, round rotation) |
 
 ### Default Reviewer Assignments
 
 The 5 review angles (`correctness`, `tests`, `simplicity`, `security`, `contracts`) all run on
-`ollama-cloud/deepseek-v4.1-flash`, or on the model from the user's `subagents.agentOverrides`
-when one is configured:
+`model: "inherit"` — the orchestrator's current model — or on the model from the user's
+`subagents.agentOverrides` when one is configured:
 
 - **correctness / tests / simplicity / contracts** (`reviewer`)
 - **security** (`reviewer`; `reviewers.security-reviewer` for auth/PIPL-heavy diffs)
