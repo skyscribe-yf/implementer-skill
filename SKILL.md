@@ -189,7 +189,23 @@ contract — fix the prompt.
 
 ## Phase 2: Review-Fix Loop (max 20 rounds)
 
-Pre-flight: Phase Gate passed. Each round:
+**Precondition — the reviewer must be able to read the diff.** §B allows `git diff` /
+`git log` / `git show` / `gh pr checks`, which all need a shell. Phase 1 commits the work,
+so by Phase 2 the change is in COMMITS and a plain `git diff` is EMPTY. Before dispatching,
+confirm your reviewer can reach the committed range; otherwise the round silently reviews
+nothing (a reviewer that cannot see the diff still writes a plausible report).
+
+Two acceptable resolutions, in order of preference:
+
+1. **Use a reviewer with read-only shell access** (on pi: `worker` with an explicit
+   read-only task, not the bundled `reviewer` — see `platform/pi/appendix.md`).
+2. **Supply the diff inline**: put `git show <sha>` / `git diff origin/<base>...HEAD` output
+   in the prompt as a supplied artifact. §B's "establishable by reading" still holds.
+
+Never dispatch a reviewer that has neither — record `BLOCKED` instead of running a vacuous
+review.
+
+Each round:
 1. Dispatch one fresh-context, read-only reviewer per angle — all five, in parallel,
    each with §B pasted verbatim. Angles: ① Correctness & regressions ② Tests &
    validation ③ Simplicity & maintainability ④ Security & privacy ⑤ Contracts & project

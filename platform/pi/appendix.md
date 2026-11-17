@@ -43,8 +43,15 @@ subagent({
 ### Roles
 
 - Lanes and fix-workers → `worker-override.worker` (or `worker` when no override is configured).
-- Reviewers → `reviewer-override.reviewer` (or `reviewer`); `reviewers.security-reviewer` for
-  auth/PIPL-heavy diffs.
+- Reviewers → `worker-override.worker` (or `worker`) with an explicit READ-ONLY task, **not**
+  the bundled `reviewer`. The bundled `reviewer` declares
+  `tools: read, grep, find, ls, watchdog_diff, contact_supervisor` — no shell — and its own agent
+  file says "Do not use shell commands … or request general Git access". §B permits `git diff` /
+  `git log` / `git show` / `gh pr checks`, and Phase 1 commits the work, so a `reviewer` child
+  gets an EMPTY `watchdog_diff` ("No working-tree changes against reviewer-launch HEAD. Committed
+  changes are not included") and cannot review a committed range at all. If you must use it, paste
+  the `git show <sha>` output into the prompt as a supplied artifact.
+  `reviewers.security-reviewer` for auth/PIPL-heavy diffs (check its tool list the same way).
 - Context gathering → `scout-override.scout`.
 
 ### Model policy and round rotation
